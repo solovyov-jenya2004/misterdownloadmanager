@@ -27,6 +27,7 @@ pub mod blocklist;
 mod names;
 pub mod public_trackers;
 pub mod rename_plugin;
+mod tracker_http;
 pub mod trackers;
 mod watch;
 pub use names::{UnsafeName, check as check_names};
@@ -81,6 +82,10 @@ pub fn check_relative_path(path: &Path) -> Result<(), UnsafeName> {
 pub enum TorrentError {
     #[error("this is not a magnet link or a .torrent file")]
     NotATorrent,
+    /// A .torrent whose pieces don't fit its files, or that librqbit can't count (a piece length
+    /// of 0, or too large): refused before librqbit reads it (`check_pieces`).
+    #[error("this .torrent file is damaged: its pieces don't match its files")]
+    BadPieces,
     /// A file name this system can't write safely (`names`, #40): the torrent is refused, nothing
     /// is written.
     #[error("this torrent has a file name that isn't safe to write here: {} ({})", .0.path, .0.why)]
@@ -117,9 +122,45 @@ pub fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// A .torrent file's bytes: a torrent, whose names are safe for this system (`names`).
+/// The largest piece a torrent may have: many times the largest that tools make (64 or 128 MiB).
+/// librqbit counts a piece's 16 KiB blocks and keeps a piece's data whole while it checks it.
+const MAX_PIECE_LENGTH: u64 = 512 << 20;
+
+/// The size of the blocks librqbit asks peers for, which it counts (`Lengths`).
+const BLOCK: u64 = 16 << 10;
+
+/// Whether a torrent's pieces are ones librqbit can work with: a piece length it can divide by
+/// ([`MAX_PIECE_LENGTH`] at most), files whose sizes add up, as many pieces and blocks as its
+/// counts hold (`u32`), and exactly one hash for each piece (20 bytes each), so the file's own
+/// size bounds how many pieces it can claim. Read before librqbit reads them (`validate`).
+fn check_pieces<B: AsRef<[u8]>>(info: &librqbit::TorrentMetaV1Info<B>) -> Result<(), TorrentError> {
+    let piece = u64::from(info.piece_length);
+    if piece == 0 || piece > MAX_PIECE_LENGTH {
+        return Err(TorrentError::BadPieces);
+    }
+    let total = match (info.length, info.files.as_ref()) {
+        (Some(length), None) => Some(length),
+        (None, Some(files)) => files
+            .iter()
+            .try_fold(0u64, |sum, f| sum.checked_add(f.length)),
+        // librqbit's own error says which (none, both, an empty list).
+        _ => return Ok(()),
+    }
+    .ok_or(TorrentError::BadPieces)?;
+    let pieces = total.div_ceil(piece);
+    let blocks = pieces.saturating_mul(piece.div_ceil(BLOCK));
+    let hashes = info.pieces.as_ref().len() as u64;
+    if pieces > u64::from(u32::MAX) || blocks > u64::from(u32::MAX) || hashes != pieces * 20 {
+        return Err(TorrentError::BadPieces);
+    }
+    Ok(())
+}
+
+/// A .torrent file's bytes: a torrent, whose pieces librqbit can work with ([`check_pieces`])
+/// and whose names are safe for this system (`names`).
 fn check_bytes(torrent: &[u8]) -> Result<(), TorrentError> {
     let meta = librqbit::torrent_from_bytes(torrent).map_err(|_| TorrentError::NotATorrent)?;
+    check_pieces(&meta.info.data)?;
     safe_names(
         meta.info
             .data
@@ -132,6 +173,7 @@ fn check_bytes(torrent: &[u8]) -> Result<(), TorrentError> {
 /// A magnet link for a .torrent: its hash, its name and its trackers (`trackers::listed`).
 pub fn magnet_link(torrent: &[u8]) -> Option<String> {
     let meta = librqbit::torrent_from_bytes(torrent).ok()?;
+    check_pieces(&meta.info.data).ok()?;
     let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
     let mut link = format!("magnet:?xt=urn:btih:{}", meta.info_hash.as_string());
     if let Some(name) = meta.info.data.validate().ok()?.name() {
@@ -554,6 +596,9 @@ pub struct Config {
     /// The DHT's first nodes (`host:port`); None: librqbit's own (public routers). Tests and test
     /// tools name nodes on loopback.
     pub dht_bootstrap: Option<Vec<String>>,
+    /// Tests: UDP trackers on this computer or the local network are sent to as well. Off (always,
+    /// outside tests): only those on the internet (`udp_tracker_filter`).
+    pub local_udp_trackers: bool,
     /// Options → Proxy / Socks → Network adapter (#35, #143): what holds every socket of the
     /// session to the adapter. UPnP and local peer discovery are off then: they speak to the
     /// local network, not through the adapter.
@@ -601,6 +646,7 @@ impl Config {
             blocklist: None,
             offline: false,
             dht_bootstrap: None,
+            local_udp_trackers: false,
             bind: None,
         }
     }
@@ -663,10 +709,6 @@ pub struct Torrents {
     api: Api,
     /// Through a proxy: UDP trackers are dropped (`trackers::allowed`).
     proxied: bool,
-    /// One add at a time: librqbit gives a new torrent the saved ids' highest plus one, so two
-    /// adds at once both took id 0, and the second was answered "already managed" with the
-    /// first one's handle: it was never added (two torrents started together, #39).
-    adding: tokio::sync::Mutex<()>,
     /// librqbit's saved state (`session.json`, and each torrent's .torrent and piece map).
     session_dir: PathBuf,
     /// Each checking torrent's bytes checked and when they last moved: librqbit leaves a check
@@ -874,6 +916,16 @@ fn listener(cfg: &Config, port: u16) -> Option<ListenerOptions> {
     })
 }
 
+/// Which UDP tracker addresses the session may send to: those on the internet
+/// (`trackers::public`), as for the trackers a torrent names. None (every address) for a test's
+/// session: offline (no trackers asked at all) or with its trackers on loopback.
+fn udp_tracker_filter(any: bool) -> Option<librqbit::UdpTrackerAddrFilter> {
+    (!any).then(|| {
+        Arc::new(|tracker: SocketAddr| trackers::public(tracker.ip()))
+            as librqbit::UdpTrackerAddrFilter
+    })
+}
+
 /// How many ports [`port_for_both`] asks the system for before leaving the choice to librqbit.
 const PORT_TRIES: usize = 20;
 
@@ -959,6 +1011,7 @@ impl Torrents {
             .filter(|p| p.is_file())
             .and_then(|p| url::Url::from_file_path(p).ok())
             .map(|u| u.to_string());
+        let guard = tracker_http::Guard::new(cfg.proxy.as_deref());
         let opts = |port: u16| SessionOptions {
             dht: dht(),
             listen: listener(&cfg, port),
@@ -1004,7 +1057,20 @@ impl Torrents {
             // Its HTTP clients (trackers, UPnP) with MDM's TLS setup: on a system without CA
             // certificates librqbit's own can't be built and the session wouldn't start; with
             // it, plain HTTP trackers work and HTTPS ones fail saying why (mdm_engine::tls).
-            configure_http_client: Some(Arc::new(mdm_engine::tls::configure)),
+            // A tracker's redirects and the addresses its name leads to are held to the same
+            // rule as the trackers a torrent names (`tracker_http`).
+            configure_http_client: Some({
+                let guard = guard.clone();
+                Arc::new(move |b| guard.configure(b))
+            }),
+            // UPnP's own: the router is on the local network, which the trackers' client keeps
+            // away from. librqbit asks only the device that answered its search, at its own
+            // address; this client looks up no name and follows no redirect off it.
+            configure_upnp_http_client: Some(Arc::new(tracker_http::configure_upnp)),
+            // A UDP tracker's addresses, as its name resolves, held to the rule of the trackers
+            // a torrent names: a name that leads to this computer or the local network isn't
+            // sent anything (HTTP trackers: `tracker_http`).
+            udp_tracker_filter: udp_tracker_filter(cfg.offline || cfg.local_udp_trackers),
             // The peers others name (trackers, the DHT, other peers), only at addresses on the
             // internet: one on this computer or the local network would let a torrent make MDM
             // connect into the network it sits in, as a tracker there would (`trackers`). The
@@ -1013,6 +1079,11 @@ impl Torrents {
             peer_filter: (!cfg.offline).then(|| {
                 Arc::new(|peer: SocketAddr| trackers::public(peer.ip())) as librqbit::PeerFilter
             }),
+            // librqbit notices the network coming back (a new address, a wake from sleep, the
+            // DHT answering again) and dials the peers that died with it at once. A test's
+            // session is on loopback and is told itself (`Session::network_changed`): the
+            // computer running the tests changing networks doesn't reach it.
+            disable_network_watch: cfg.offline,
             ..Default::default()
         };
         prepare_saved(&cfg.state_dir.join("session"), proxied);
@@ -1096,7 +1167,6 @@ impl Torrents {
             session,
             api,
             proxied,
-            adding: tokio::sync::Mutex::new(()),
             session_dir: cfg.state_dir.join("session"),
             checks,
             watch,
@@ -1123,9 +1193,13 @@ impl Torrents {
                 }
                 AddTorrent::from_url(m)
             }
-            Source::File(b) => AddTorrent::from_bytes(
-                trackers::filter_torrent(b, self.proxied).ok_or(TorrentError::NotATorrent)?,
-            ),
+            Source::File(b) => {
+                // Read here before librqbit reads it (`check_pieces`).
+                check_bytes(b)?;
+                AddTorrent::from_bytes(
+                    trackers::filter_torrent(b, self.proxied).ok_or(TorrentError::NotATorrent)?,
+                )
+            }
         };
         if let Some(l) = lookup {
             let dht = self.session.get_dht();
@@ -1206,13 +1280,13 @@ impl Torrents {
             initial_peers: (!peers.is_empty()).then_some(peers),
             ..Default::default()
         };
-        let res = {
-            let _one = self.adding.lock().await;
-            self.session
-                .add_torrent(AddTorrent::from_bytes(torrent), Some(opts))
-                .await
-                .map_err(engine)?
-        };
+        // Adds run side by side: librqbit gives each torrent an id of its own (rqbit #711; two
+        // adds at once took the same id, and the second got the first's handle, #39).
+        let res = self
+            .session
+            .add_torrent(AddTorrent::from_bytes(torrent), Some(opts))
+            .await
+            .map_err(engine)?;
         let handle = res
             .into_handle()
             .ok_or_else(|| engine("the torrent was listed instead of started"))?;
@@ -1326,6 +1400,8 @@ impl Torrents {
             TorrentStatsState::Paused => Ok(()),
             // librqbit pausing a check stops it where it is and leaves the torrent Initializing
             // for good (a Recheck stuck at 17 %): the check ends first, then it is paused.
+            // Still so with rqbit #721, which keeps only a pause that comes after the check's
+            // last piece: without this, `pausing_during_the_check_lets_it_finish` stops at 0 %.
             TorrentStatsState::Initializing { .. } => {
                 let session = self.session.clone();
                 let (wanted, hash) = (self.pause_after_check.clone(), hash.to_owned());
@@ -1901,8 +1977,6 @@ mod tests {
             Recorder { addr, from }
         }
 
-        // Its tests bind 127.0.0.2, which macOS hasn't.
-        #[cfg(not(target_os = "macos"))]
         async fn tcp(reply: &'static [u8]) -> Recorder {
             let l = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
@@ -1972,6 +2046,8 @@ mod tests {
             dht_bootstrap: Some(vec![dht.addr.to_string()]),
             bind: Some(Bind::Address(bound)),
             require_authorization: false,
+            // Its UDP tracker is on loopback.
+            local_udp_trackers: true,
             ..Config::new(tmp.path().join("s2"))
         })
         .await
@@ -2094,6 +2170,65 @@ mod tests {
         let seen = proxy.seen();
         assert!(seen.iter().all(|f| f.ip() == bound), "{seen:?}");
         eprintln!("#143: the proxy reached from {seen:?}");
+        t.stop().await;
+    }
+
+    /// A UDP tracker whose address, or whose name once looked up (`localhost`), is on this
+    /// computer is sent nothing, while the same session's HTTP tracker is asked (it is given to
+    /// the session straight, as an address: MDM's own `add` drops trackers on loopback, #40).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_udp_tracker_on_this_computer_is_sent_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("seed").join("set");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.bin"), vec![5u8; 50_000]).unwrap();
+        let torrent = make_torrent(&src).await;
+        let by_address = Recorder::udp().await;
+        let by_name = Recorder::udp().await;
+        let http_tracker = Recorder::tcp(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 27\r\n\r\nd8:intervali1800e5:peers0:e",
+        )
+        .await;
+        let t = Torrents::start(Config {
+            upnp: false,
+            lsd: false,
+            dht: false,
+            listen_ip: Some(Ipv4Addr::LOCALHOST.into()),
+            require_authorization: false,
+            ..Config::new(tmp.path().join("s"))
+        })
+        .await
+        .unwrap();
+        let out = tmp.path().join("got");
+        t.session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(out.to_string_lossy().into_owned()),
+                    overwrite: true,
+                    trackers: Some(vec![
+                        format!("udp://{}/announce", by_address.addr),
+                        format!("udp://localhost:{}/announce", by_name.addr.port()),
+                        format!("http://{}/announce", http_tracker.addr),
+                    ]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while http_tracker.seen().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the HTTP tracker wasn't asked"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The trackers are asked together, so a UDP announce would be on its way by now; the
+        // wait can only let one more arrive, never fail the test.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(by_address.seen().is_empty(), "{:?}", by_address.seen());
+        assert!(by_name.seen().is_empty(), "{:?}", by_name.seen());
         t.stop().await;
     }
 
@@ -2722,6 +2857,222 @@ mod tests {
         t.stop().await;
     }
 
+    /// A single-file .torrent of `length` bytes in pieces of `piece` bytes, with `hashes` bytes
+    /// of piece hashes.
+    fn torrent_with_pieces(length: u64, piece: u64, hashes: usize) -> Vec<u8> {
+        let mut t =
+            format!("d4:infod6:lengthi{length}e4:name5:a.bin12:piece lengthi{piece}e").into_bytes();
+        t.extend(format!("6:pieces{hashes}:").bytes());
+        t.extend(std::iter::repeat_n(0u8, hashes));
+        t.extend(b"ee");
+        t
+    }
+
+    /// A piece length of 0 or too large, more pieces or blocks than librqbit counts, or not one
+    /// hash per piece: refused before librqbit reads the torrent, by every call that takes one,
+    /// with the same error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn torrents_whose_pieces_dont_add_up_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = Torrents::start(offline(&tmp.path().join("state")))
+            .await
+            .unwrap();
+        let out = tmp.path().join("out");
+        let multi = |piece: u64, lens: &[u64]| {
+            let mut t = b"d4:infod5:filesl".to_vec();
+            for (i, len) in lens.iter().enumerate() {
+                t.extend(format!("d6:lengthi{len}e4:pathl5:{i}.binee").bytes());
+            }
+            t.extend(format!("e4:name3:set12:piece lengthi{piece}e6:pieces20:").bytes());
+            t.extend([0u8; 20]);
+            t.extend(b"ee");
+            t
+        };
+        let bad = [
+            // Piece length 0.
+            torrent_with_pieces(5, 0, 20),
+            // Larger than any torrent's pieces.
+            torrent_with_pieces(5, 1 << 30, 20),
+            torrent_with_pieces(5, u64::from(u32::MAX), 20),
+            // More pieces than librqbit counts (u32), hashes or not.
+            torrent_with_pieces(1 << 40, 1, 20),
+            // More 16 KiB blocks than it counts.
+            torrent_with_pieces(1 << 47, 512 << 20, 20 * (1 << 18)),
+            // 1 piece, and no hash for it, or part of one; 2 pieces and a hash for one.
+            torrent_with_pieces(5, 16384, 0),
+            torrent_with_pieces(5, 16384, 19),
+            torrent_with_pieces(16385, 16384, 20),
+            // More hashes than pieces: one more (whole or in part), or many.
+            torrent_with_pieces(16384, 16384, 40),
+            torrent_with_pieces(5, 16384, 21),
+            torrent_with_pieces(5, 1, 120),
+            // Sizes that add past what a u64 holds.
+            multi(16384, &[u64::MAX, 2]),
+        ];
+        for bytes in &bad {
+            let what = String::from_utf8_lossy(&bytes[..bytes.len().min(90)]).into_owned();
+            assert!(
+                matches!(files_from_bytes(bytes), Err(TorrentError::BadPieces)),
+                "{what}"
+            );
+            assert_eq!(magnet_link(bytes), None, "{what}");
+            assert_eq!(file_done_from_map(bytes, &[0xff; 64]), None, "{what}");
+            let listed = t
+                .metadata(&Source::File(bytes.clone()), Duration::from_secs(5), None)
+                .await;
+            assert!(
+                matches!(listed, Err(TorrentError::BadPieces)),
+                "{what}: {listed:?}"
+            );
+            let added = t.add(bytes, &out, None, Vec::new(), false).await;
+            assert!(
+                matches!(added, Err(TorrentError::BadPieces)),
+                "{what}: {added:?}"
+            );
+        }
+        assert_eq!(
+            TorrentError::BadPieces.to_string(),
+            "this .torrent file is damaged: its pieces don't match its files"
+        );
+        assert!(!out.exists(), "nothing was written");
+        // Their neighbours that add up still list: the smallest and largest pieces, one piece
+        // or many, a last piece shorter or whole.
+        for good in [
+            torrent_with_pieces(5, 1, 100),
+            torrent_with_pieces(5, 16384, 20),
+            torrent_with_pieces(16384, 16384, 20),
+            torrent_with_pieces(16385, 16384, 40),
+            torrent_with_pieces(32768, 16384, 40),
+            torrent_with_pieces(5, 512 << 20, 20),
+            multi(16384, &[3, 2]),
+        ] {
+            let what = String::from_utf8_lossy(&good[..good.len().min(90)]).into_owned();
+            assert!(files_from_bytes(&good).is_ok(), "{what}");
+            assert!(magnet_link(&good).is_some(), "{what}");
+            let listed = t
+                .metadata(&Source::File(good.clone()), Duration::from_secs(5), None)
+                .await;
+            assert!(listed.is_ok(), "{what}: {listed:?}");
+        }
+        t.stop().await;
+    }
+
+    /// A magnet link with a file range of a hundred billion files (`so=`): the range is left
+    /// out and the lookup goes on as any other (here, with no DHT or tracker to ask, it says
+    /// so at once).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_magnet_s_file_range_never_reaches_the_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = Torrents::start(offline(&tmp.path().join("state")))
+            .await
+            .unwrap();
+        for so in [
+            "0-99999999999",
+            "0-18446744073709551615",
+            "5,0-99999999999,7",
+        ] {
+            let magnet = format!(
+                "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=x&so={so}"
+            );
+            let looked = t
+                .metadata(&Source::Magnet(magnet), Duration::from_secs(1), None)
+                .await;
+            assert!(
+                matches!(looked, Err(TorrentError::Engine(ref why)) if why.contains("no known way")),
+                "{so}: {looked:?}"
+            );
+        }
+        t.stop().await;
+    }
+
+    /// The session's tracker client is MDM's (`tracker_http`): an HTTP tracker's redirect within
+    /// the same address is followed and says nothing of where it came from (no `Referer`). That
+    /// the client refuses a redirect elsewhere, and names that lead to this computer, is tested
+    /// in `tracker_http`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_session_asks_trackers_through_mdm_s_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("seed").join("set");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.bin"), vec![1u8; 20_000]).unwrap();
+        let torrent = make_torrent(&src).await;
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match s.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                    let answer = if req.starts_with("get /announce") {
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/again\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        let body = "d8:intervali600e5:peers0:e";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    // Recorded before it is answered: the request its redirect leads to can't
+                    // be recorded first, however late this task runs after its answer.
+                    let _ = tx.send(req);
+                    let _ = s.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        let t = Torrents::start(Config {
+            upnp: false,
+            lsd: false,
+            dht: false,
+            listen_ip: Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            require_authorization: false,
+            ..Config::new(tmp.path().join("s"))
+        })
+        .await
+        .unwrap();
+        // The tracker on loopback, given straight to librqbit (MDM's own adds drop it).
+        t.session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(tmp.path().join("got").to_string_lossy().into_owned()),
+                    overwrite: true,
+                    paused: false,
+                    trackers: Some(vec![format!("http://127.0.0.1:{port}/announce")]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let wait = Duration::from_secs(20);
+        let first = tokio::time::timeout(wait, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.starts_with("get /announce?"), "{first}");
+        let again = tokio::time::timeout(wait, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(again.starts_with("get /again"), "{again}");
+        assert!(!again.contains("\r\nreferer:"), "{again}");
+        t.stop().await;
+    }
+
     /// #40: the torrents librqbit saved go through the name check when the session starts again;
     /// one saved without its .torrent is taken out too (the app adds it again from its own copy).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3182,6 +3533,43 @@ mod tests {
         leecher.stop().await;
     }
 
+    /// A torrent made from a folder lists its files by name, not in the order the file system
+    /// keeps them (hashed on ext4, newest first on tmpfs, case-insensitive on NTFS): the same
+    /// files make the same torrent everywhere, and which files share a piece doesn't change
+    /// from one computer to the next.
+    #[tokio::test]
+    async fn a_torrent_made_from_a_folder_lists_its_files_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut hashes = Vec::new();
+        for (n, order) in [
+            ["c.txt", "b.bin", "a.bin", "Z.bin"],
+            ["a.bin", "Z.bin", "c.txt", "b.bin"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let src = tmp.path().join(n.to_string()).join("set");
+            std::fs::create_dir_all(&src).unwrap();
+            for name in order {
+                std::fs::write(src.join(name), vec![name.as_bytes()[0]; 20_000]).unwrap();
+            }
+            let torrent = make_torrent(&src).await;
+            let parsed = librqbit::torrent_from_bytes(&torrent).unwrap();
+            let names: Vec<String> = parsed
+                .info
+                .data
+                .files
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|f| String::from_utf8_lossy(f.path[0].as_ref()).into_owned())
+                .collect();
+            assert_eq!(names, ["Z.bin", "a.bin", "b.bin", "c.txt"]);
+            hashes.push(parsed.info_hash);
+        }
+        assert_eq!(hashes[0], hashes[1], "the same files, the same torrent");
+    }
+
     /// Unticked files are not made in the download's folder: the pieces they share with the
     /// ticked one are kept in a parts file, and a file ticked later gets its bytes from there.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3223,6 +3611,10 @@ mod tests {
             index("a.bin").unwrap(),
             index("b.bin").unwrap(),
             index("c.txt").unwrap(),
+        );
+        assert!(
+            ia < ib && ib < ic,
+            "listed by name, so c.txt shares b.bin's last piece"
         );
 
         // The leecher, as the app runs it: only the files MDM hands over are opened.
@@ -3620,41 +4012,71 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
 
-        // The window's reading, every 2 ms, from just before the re-add until it downloads
-        // again.
-        let over = std::sync::atomic::AtomicBool::new(false);
-        let sample = async {
-            let mut seen = Vec::new();
-            while !over.load(std::sync::atomic::Ordering::SeqCst) {
-                seen.push(leecher.seen(&h2));
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-            seen
+        // The window's readings, 2 ms apart, from just before the re-add until its own numbers
+        // are back. The re-add is run a step at a time and left where the torrent is out of the
+        // session until the watch has read it there: left to itself it is back in about 2 ms,
+        // between two of the watch's readings (#2002).
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let pause = || tokio::time::sleep(Duration::from_millis(2));
+        let mut seen = Vec::new();
+        let mut look = |waiting_for: &str| {
+            let s = leecher
+                .seen(&h2)
+                .unwrap_or_else(|| panic!("reading {}: out of the session", seen.len()));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never {waiting_for}: {s:?}"
+            );
+            let phase = s.phase;
+            seen.push(s);
+            phase
         };
-        let readd = async {
-            leecher.readd(&h2, &torrent, false).await.unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            loop {
-                let s = leecher.stats(&h2).unwrap();
-                if matches!(s.phase, Phase::Downloading | Phase::Finished) {
-                    break;
-                }
-                assert!(std::time::Instant::now() < deadline, "never resumed: {s:?}");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            // And a reading of the watch's own after that.
-            tokio::time::sleep(watch::EVERY * 2).await;
-            over.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Whether the watch hasn't read since `last`: nothing is put meanwhile, so each of its
+        // readings is a new `Arc`.
+        let unread = |last: &Option<Arc<watch::Seen>>| {
+            leecher.watch.get(&h2).as_ref().map(Arc::as_ptr) == last.as_ref().map(Arc::as_ptr)
         };
-        let (seen, ()) = tokio::join!(sample, readd);
-        assert!(seen.len() > 20, "too few readings: {}", seen.len());
+        let mut readd = std::pin::pin!(leecher.readd(&h2, &torrent, false));
+        // Out of the session: the re-add stays there while it isn't run. It holds librqbit's
+        // persistence lock, so nothing else is added or removed in this session meanwhile.
+        while leecher.has(&h2) {
+            look("out of the session");
+            let step =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(readd.as_mut().poll(cx))).await;
+            assert!(step.is_pending(), "over before it was out: {step:?}");
+            pause().await;
+        }
+        // Two readings of the watch's there: the first may have begun before the delete.
+        for _ in 0..2 {
+            let last = leecher.watch.get(&h2);
+            while unread(&last) {
+                look("read out of the session");
+                pause().await;
+            }
+        }
+        look("read out of the session");
+        assert!(!leecher.has(&h2), "back before the watch read it");
+        // Run to its end. Back and checked: the reading that finds it so ends the re-add.
+        let (readded, ()) = tokio::join!(readd, async {
+            while !matches!(
+                look("its own numbers again"),
+                Phase::Downloading | Phase::Finished
+            ) {
+                pause().await;
+            }
+        });
+        readded.unwrap();
+        // And a reading of the watch's own after that.
+        let had = leecher.watch.get(&h2);
+        while unread(&had) {
+            look("read again");
+            pause().await;
+        }
+        look("read again");
         // Never less than the reading before it (the watch's readings lag librqbit's by up to
         // one, so not against `before` itself).
         let (mut done, mut files) = (0, 0);
         for (i, s) in seen.iter().enumerate() {
-            let s = s
-                .as_ref()
-                .unwrap_or_else(|| panic!("reading {i}: out of the session"));
             let in_files: u64 = s.file_done.iter().sum();
             assert!(
                 s.done >= done && in_files >= files,
@@ -3665,7 +4087,7 @@ mod tests {
             assert_eq!(s.total, before.total, "reading {i}: {s:?}");
             (done, files) = (s.done, in_files);
         }
-        let last = seen.last().unwrap().as_ref().unwrap();
+        let last = seen.last().unwrap();
         assert!(
             matches!(last.phase, Phase::Downloading | Phase::Finished),
             "its own numbers again: {last:?}"
@@ -3739,6 +4161,10 @@ mod tests {
             index("a.bin").unwrap(),
             index("b.bin").unwrap(),
             index("c.txt").unwrap(),
+        );
+        assert!(
+            ia < ib && ib < ic,
+            "listed by name, so c.txt shares b.bin's last piece"
         );
         let state = tmp.path().join("s2");
         let session = state.join("session");
@@ -4274,6 +4700,60 @@ mod tests {
         want.sort();
         assert_eq!(all, want);
         t.stop().await;
+    }
+
+    /// #39: many torrents added at once, each from a task of its own, are all in the session,
+    /// each its own, and no add waits for another. librqbit gives each a torrent id of its own
+    /// (rqbit #711): it used to give them the same one, and the later ones got the first's
+    /// handle, so MDM let only one add in at a time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_torrents_added_at_once_are_all_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = std::sync::Arc::new(
+            Torrents::start(offline(&tmp.path().join("state")))
+                .await
+                .unwrap(),
+        );
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let adds: Vec<_> = (0..16)
+            .map(|i| {
+                let (t, gate) = (t.clone(), gate.clone());
+                let out = tmp.path().join(format!("out-{i}"));
+                tokio::spawn(async move {
+                    let torrent = torrent_naming(&format!("{i}.bin"));
+                    gate.wait().await;
+                    t.add(&torrent, &out, None, Vec::new(), true).await
+                })
+            })
+            .collect();
+        let mut got = Vec::new();
+        for add in adds {
+            got.push(add.await.unwrap().expect("every add succeeds"));
+        }
+        let mut want: Vec<String> = (0..16)
+            .map(|i| {
+                librqbit::torrent_from_bytes(&torrent_naming(&format!("{i}.bin")))
+                    .unwrap()
+                    .info_hash
+                    .as_string()
+            })
+            .collect();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "each add answered with its own torrent");
+        let mut all = t.hashes();
+        all.sort();
+        assert_eq!(all, want, "all of them in the session");
+        // Saved under ids of their own: a restart finds all of them.
+        t.stop().await;
+        drop(t);
+        let again = Torrents::start(offline(&tmp.path().join("state")))
+            .await
+            .unwrap();
+        let mut back = again.hashes();
+        back.sort();
+        assert_eq!(back, want, "all of them back after a restart");
+        again.stop().await;
     }
 
     /// #39: what a seeder sends is held back by the session's upload limit, then by its
@@ -4820,6 +5300,29 @@ mod tests {
         seeder.stop().await;
     }
 
+    /// A UDP tracker's name may lead anywhere once looked up: only its addresses on the
+    /// internet are sent to, as the trackers a torrent names are checked.
+    #[test]
+    fn udp_trackers_are_sent_to_only_on_the_internet() {
+        let filter = udp_tracker_filter(false).expect("a filter");
+        for local in [
+            "127.0.0.1:6969",
+            "[::1]:6969",
+            "192.168.1.1:6969",
+            "10.0.0.1:1337",
+            "169.254.169.254:80",
+            "[fd00::1]:6969",
+            "[::ffff:127.0.0.1]:6969",
+            "0.0.0.0:6969",
+        ] {
+            assert!(!filter(local.parse().unwrap()), "{local}");
+        }
+        for public in ["8.8.8.8:6969", "[2001:4860:4860::8888]:6969"] {
+            assert!(filter(public.parse().unwrap()), "{public}");
+        }
+        assert!(udp_tracker_filter(true).is_none());
+    }
+
     /// #1384: what the session listens on, as Torrent settings say: TCP and uTP by default, on
     /// the adapter's address or device when one is chosen, nothing with a proxy (SOCKS5 carries
     /// TCP only, and librqbit's uTP socket is the listener's: no listener, no uTP at all).
@@ -5019,5 +5522,461 @@ mod tests {
         );
         leecher.stop().await;
         seeder.stop().await;
+    }
+
+    /// A link to `to` on loopback that the test cuts and restores, as a network that drops
+    /// and comes back: cut, its connections are closed and new ones closed as soon as they are
+    /// accepted (a dial on a dead network fails at once). Every dial through it is counted
+    /// once it was decided: a dial counted while cut was refused already, whatever the test
+    /// does next.
+    struct Link {
+        addr: SocketAddr,
+        up: tokio::sync::watch::Sender<bool>,
+        dials: Arc<AtomicUsize>,
+    }
+
+    impl Link {
+        async fn to(to: SocketAddr) -> Link {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let up = tokio::sync::watch::Sender::new(true);
+            let dials = Arc::new(AtomicUsize::new(0));
+            let (state, counter) = (up.subscribe(), dials.clone());
+            tokio::spawn(async move {
+                while let Ok((mut down, _)) = listener.accept().await {
+                    if !*state.borrow() {
+                        drop(down);
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut state = state.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut peer) = tokio::net::TcpStream::connect(to).await else {
+                            return;
+                        };
+                        tokio::select! {
+                            _ = tokio::io::copy_bidirectional(&mut down, &mut peer) => {}
+                            _ = state.wait_for(|up| !*up) => {}
+                        }
+                    });
+                }
+            });
+            Link { addr, up, dials }
+        }
+
+        fn dials(&self) -> usize {
+            self.dials.load(Ordering::SeqCst)
+        }
+    }
+
+    /// `t`'s torrent `h` once `done` says so, polled; it fails after `secs`.
+    async fn wait_for(
+        t: &Torrents,
+        h: &str,
+        what: &str,
+        secs: u64,
+        done: impl Fn(&Stats) -> bool,
+    ) -> Stats {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            let s = t.stats(h).unwrap();
+            if done(&s) {
+                return s;
+            }
+            assert!(std::time::Instant::now() < deadline, "never {what}: {s:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Once `done` holds, polled; it fails after `secs`.
+    async fn until(what: &str, secs: u64, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "never {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `t`'s torrent `h`'s peers by their state in librqbit: (queued, connecting, live, dead).
+    /// It tells when a refused dial was taken as a failure, which the link can't.
+    fn peer_states(t: &Torrents, h: &str) -> (u32, u32, u32, u32) {
+        let s = t.session.get(id(h).unwrap()).unwrap().stats();
+        s.live.map_or((0, 0, 0, 0), |l| {
+            let p = &l.snapshot.peer_stats;
+            (p.queued, p.connecting, p.live, p.dead)
+        })
+    }
+
+    /// ikatson/rqbit#363: a network that drops (Wi-Fi, sleep, a VPN switching) kills every peer
+    /// connection, and each dead peer waits out a backoff that climbs while the network is gone
+    /// (10-20 s, then 60-120 s, ... up to an hour): back on the network, the torrent stayed
+    /// stalled. Told the network came back (librqbit's watcher does it on a new address, a wake
+    /// or the DHT answering again; on loopback nothing changes, so the test tells it), the
+    /// session dials its dead peer at once, once: the download goes on within seconds, with no
+    /// burst of reconnects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_torrent_picks_up_at_once_when_the_network_comes_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("seed").join("net");
+        std::fs::create_dir_all(&src).unwrap();
+        let data: Vec<u8> = (0..1_048_576u32).map(|i| (i % 233) as u8).collect();
+        std::fs::write(src.join("data.bin"), &data).unwrap();
+        let torrent = make_torrent(&src).await;
+        let seeder = Torrents::start(Config {
+            utp: false,
+            ..offline(&tmp.path().join("s1"))
+        })
+        .await
+        .unwrap();
+        let hash = seeder
+            .add(&torrent, &src, None, Vec::new(), false)
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while seeder.stats(&hash).unwrap().phase != Phase::Finished {
+            assert!(std::time::Instant::now() < deadline, "seeder never checked");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // 1 MiB at 64 KiB/s: the download lasts while the network drops and comes back.
+        seeder.set_upload_limit(Some(64 * 1024));
+        let link = Link::to(seeder.listen_addr().expect("seeder listens")).await;
+
+        // The leecher doesn't listen: the seeder can't reach it around the link.
+        let leecher = Torrents::start(Config {
+            listen: false,
+            utp: false,
+            ..offline(&tmp.path().join("s2"))
+        })
+        .await
+        .unwrap();
+        let out = tmp.path().join("got");
+        let h = leecher
+            .add(&torrent, &out, None, vec![link.addr], false)
+            .await
+            .unwrap();
+        // Downloading from the peer: while the torrent is first checked, `done` counts the
+        // bytes checked (the whole size within moments, with nothing on disk), so `done` alone
+        // could read as a download that was over before the cut.
+        wait_for(&leecher, &h, "downloading", 30, |s| {
+            s.phase == Phase::Downloading && s.peers_live == 1 && s.fetched >= 64 * 1024
+        })
+        .await;
+
+        // The network drops: the peer dies, and its retry (10-20 s later) is refused, so the
+        // next one is a minute or more away. Each stage waits for the session to have taken
+        // the failure (the peer dead, nothing dialing), never for a span of time.
+        link.up.send_replace(false);
+        let dead = || peer_states(&leecher, &h) == (0, 0, 0, 1);
+        until("the peer dead after the cut", 10, dead).await;
+        let cut = leecher.stats(&h).unwrap();
+        let dials_at_cut = link.dials();
+        until("the peer dialed again during the cut", 40, || {
+            link.dials() > dials_at_cut
+        })
+        .await;
+        until("the retry taken as refused", 10, dead).await;
+        // Bytes received, not `done`: a piece received before the cut may still be written
+        // and checked after it.
+        let stalled = leecher.stats(&h).unwrap();
+        assert_eq!(stalled.fetched, cut.fetched, "nothing came around the cut");
+
+        // Back: on its own the torrent stays stalled (the peer's backoff runs on). An absence
+        // has no signal to wait for: 2 s are watched, and a slow computer can't bring the
+        // next retry (60 s or more after the refusal) into them.
+        link.up.send_replace(true);
+        let dials = link.dials();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            leecher.stats(&h).unwrap().fetched,
+            stalled.fetched,
+            "still stalled"
+        );
+        assert_eq!(link.dials(), dials, "no dial without the change");
+
+        // Told: the dead peer is dialed at once, and the download goes on: within 20 s, where
+        // its backoff would have waited a minute or more.
+        let told = std::time::Instant::now();
+        assert!(leecher.session.network_changed(), "the change acted");
+        wait_for(&leecher, &h, "downloading again", 20, |s| {
+            s.fetched > stalled.fetched
+        })
+        .await;
+        let resumed = told.elapsed();
+        wait_for(&leecher, &h, "well on again", 30, |s| {
+            s.done >= stalled.done + 128 * 1024
+        })
+        .await;
+        eprintln!(
+            "resumed {:.2} s after the change; dials: {} before the cut, {} during it, {} after",
+            resumed.as_secs_f64(),
+            dials_at_cut,
+            dials - dials_at_cut,
+            link.dials() - dials
+        );
+        assert_eq!(link.dials() - dials, 1, "one dial for the change, no storm");
+        leecher.stop().await;
+        seeder.stop().await;
+    }
+
+    /// Whether any handle of this process has `path` open (None: this system can't say).
+    /// Windows: an open that shares nothing fails while any other handle is open. Linux: an
+    /// entry of /proc/self/fd leads to it.
+    fn held(path: &Path) -> Option<bool> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(path)
+                    .is_err(),
+            )
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let want = std::fs::canonicalize(path).ok()?;
+            Some(
+                std::fs::read_dir("/proc/self/fd")
+                    .ok()?
+                    .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+                    .any(|p| p == want),
+            )
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    /// A seeder on loopback of a torrent of two files (1 MiB, a few bytes), uploading slowly
+    /// enough for a download to be paused half-way; and the leecher's grant for them, as the
+    /// app gives it at Start (`prepare_storage`): handles opened without following a link,
+    /// opened again (never made) by `reopen`.
+    struct Swarm {
+        tmp: tempfile::TempDir,
+        seeder: Torrents,
+        torrent: Vec<u8>,
+        meta: Meta,
+        data: Vec<u8>,
+        out: PathBuf,
+        state: PathBuf,
+    }
+
+    impl Swarm {
+        async fn new() -> Swarm {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = tmp.path().join("seed").join("set");
+            std::fs::create_dir_all(&src).unwrap();
+            let data: Vec<u8> = (0..1_048_576u32).map(|i| (i % 241) as u8).collect();
+            std::fs::write(src.join("data.bin"), &data).unwrap();
+            std::fs::write(src.join("notes.txt"), b"notes").unwrap();
+            let torrent = make_torrent(&src).await;
+            let seeder = Torrents::start(offline(&tmp.path().join("s1")))
+                .await
+                .unwrap();
+            let meta = seeder
+                .metadata(
+                    &Source::File(torrent.clone()),
+                    Duration::from_secs(10),
+                    None,
+                )
+                .await
+                .unwrap();
+            let hash = seeder
+                .add(&torrent, &src, None, Vec::new(), false)
+                .await
+                .unwrap();
+            wait_for(&seeder, &hash, "checked", 20, |s| {
+                s.phase == Phase::Finished
+            })
+            .await;
+            // 1 MiB at 256 KiB/s: about 4 s, paused well before the end.
+            seeder.set_upload_limit(Some(256 * 1024));
+            let out = meta.folder_in(&tmp.path().join("got"));
+            let state = tmp.path().join("s2");
+            Swarm {
+                tmp,
+                seeder,
+                torrent,
+                meta,
+                data,
+                out,
+                state,
+            }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            let i = self
+                .meta
+                .files
+                .iter()
+                .position(|f| f.path.ends_with(name))
+                .unwrap();
+            self.out.join(&self.meta.files[i].path)
+        }
+
+        /// What the app hands the engine at Start: every file, made if `create`.
+        fn prepared(&self, create: bool) -> std::io::Result<Vec<authorized_storage::PreparedFile>> {
+            let mut files = Vec::new();
+            for (index, f) in self.meta.files.iter().enumerate() {
+                let path = self.out.join(&f.path);
+                if create {
+                    std::fs::create_dir_all(path.parent().unwrap())?;
+                }
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(create)
+                    .truncate(false)
+                    .open(&path)?;
+                files.push(authorized_storage::PreparedFile { index, path, file });
+            }
+            Ok(files)
+        }
+
+        fn grant(&self, create: bool) {
+            let (out, meta) = (self.out.clone(), self.meta.clone());
+            let swarm_out = self.out.clone();
+            let reopen = Arc::new(move || {
+                // Opened again where they are, never made.
+                meta.files
+                    .iter()
+                    .enumerate()
+                    .map(|(index, f)| -> std::io::Result<_> {
+                        let path = swarm_out.join(&f.path);
+                        let file = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&path)?;
+                        Ok(authorized_storage::PreparedFile { index, path, file })
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()
+            });
+            authorized_storage::authorize(
+                &self.state.join("session"),
+                &self.meta.info_hash,
+                &out,
+                self.prepared(create).unwrap(),
+                reopen,
+            );
+        }
+
+        async fn leecher(&self) -> Torrents {
+            let mut config = offline(&self.state);
+            config.require_authorization = true;
+            Torrents::start(config).await.unwrap()
+        }
+    }
+
+    /// ikatson/rqbit#369: a paused torrent holds none of its files, so another program can
+    /// rename, move or delete them (on Windows too); started again (granted again, as at
+    /// Start), it finishes where they are; finished and shared, it holds them read-only
+    /// (Windows: a program that keeps writers out reads it) and they can be renamed while
+    /// seeded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_paused_torrent_lets_go_of_its_files() {
+        let swarm = Swarm::new().await;
+        let addr = swarm.seeder.listen_addr().expect("seeder listens");
+        let leecher = swarm.leecher().await;
+        swarm.grant(true);
+        let hash = leecher
+            .add(&swarm.torrent, &swarm.out, None, vec![addr], false)
+            .await
+            .unwrap();
+        let data = swarm.path("data.bin");
+        wait_for(&leecher, &hash, "half-way", 30, |s| {
+            s.done >= 256 * 1024 && s.phase == Phase::Downloading
+        })
+        .await;
+        assert_ne!(held(&data), Some(false), "open while it downloads");
+
+        leecher.pause(&hash).await.unwrap();
+        let paused = leecher.stats(&hash).unwrap();
+        assert_eq!(paused.phase, Phase::Paused);
+        assert!(paused.done < paused.total, "paused half-way: {paused:?}");
+        assert_ne!(held(&data), Some(true), "a paused torrent holds no handle");
+        assert_ne!(held(&swarm.path("notes.txt")), Some(true));
+        // Another program renames it (Explorer, a script) and puts it back.
+        let moved = swarm.tmp.path().join("moved.bin");
+        std::fs::rename(&data, &moved).expect("renaming the paused file");
+        std::fs::rename(&moved, &data).unwrap();
+
+        // Start: granted again, as the app does (`prepare_storage`), then resumed.
+        swarm.grant(false);
+        leecher.resume(&hash).await.unwrap();
+        wait_for(&leecher, &hash, "finished", 60, |s| {
+            s.phase == Phase::Finished
+        })
+        .await;
+        assert_eq!(std::fs::read(&data).unwrap(), swarm.data);
+        assert_eq!(std::fs::read(swarm.path("notes.txt")).unwrap(), b"notes");
+
+        // Finished and still shared (Keep sharing).
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let mut copy = Vec::new();
+            std::io::Read::read_to_end(
+                &mut std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0x1) // FILE_SHARE_READ: refused while anyone can write it
+                    .open(&data)
+                    .expect("a reader that keeps writers out"),
+                &mut copy,
+            )
+            .unwrap();
+            assert_eq!(copy, swarm.data);
+        }
+        std::fs::rename(&data, &moved).expect("renaming the seeded file");
+        std::fs::rename(&moved, &data).unwrap();
+
+        leecher.remove(&hash, false).await.unwrap();
+        authorized_storage::forget(&swarm.state.join("session"), &hash);
+        leecher.stop().await;
+        swarm.seeder.stop().await;
+    }
+
+    /// A file deleted while its torrent was paused, made again empty by the next Start (as
+    /// `prepare_for` makes a missing file): it isn't the file the pieces are in, so nothing is
+    /// written into it as though it held them; the torrent stops saying a file changed while it
+    /// was paused. (The app takes such a torrent out and adds it again, which checks it.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_file_made_again_while_paused_is_not_written_into() {
+        let swarm = Swarm::new().await;
+        let addr = swarm.seeder.listen_addr().expect("seeder listens");
+        let leecher = swarm.leecher().await;
+        swarm.grant(true);
+        let hash = leecher
+            .add(&swarm.torrent, &swarm.out, None, vec![addr], false)
+            .await
+            .unwrap();
+        wait_for(&leecher, &hash, "half-way", 30, |s| {
+            s.done >= 256 * 1024 && s.phase == Phase::Downloading
+        })
+        .await;
+        leecher.pause(&hash).await.unwrap();
+        let data = swarm.path("data.bin");
+        std::fs::remove_file(&data).expect("deleting the paused file");
+
+        swarm.grant(true);
+        leecher.resume(&hash).await.unwrap();
+        let s = wait_for(&leecher, &hash, "stopped", 30, |s| s.phase == Phase::Error).await;
+        let error = s.error.unwrap_or_default();
+        assert!(error.contains("moved, deleted or replaced"), "{error}");
+        assert_eq!(
+            std::fs::metadata(&data).unwrap().len(),
+            0,
+            "nothing written into the new file"
+        );
+
+        leecher.remove(&hash, false).await.unwrap();
+        authorized_storage::forget(&swarm.state.join("session"), &hash);
+        leecher.stop().await;
+        swarm.seeder.stop().await;
     }
 }

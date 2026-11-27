@@ -232,6 +232,23 @@ impl Category {
         crate::i18n::t(self.shipped_name()).to_owned()
     }
 
+    /// Its icon: the Categories tree's, and its choice's in the category drop-downs (#2008).
+    /// Silk icons standing in for IDM's XP-era category icons; a theme's icon set may replace
+    /// them (`crate::themeicons`).
+    pub fn icon(self) -> crate::chrome::IconKey {
+        let (need, silk) = match self {
+            Category::Compressed => ("cat-compressed", "page_white_zip"),
+            Category::Documents => ("cat-documents", "page_white"),
+            Category::Music => ("cat-music", "music"),
+            Category::Programs => ("cat-programs", "application_xp"),
+            Category::Video => ("cat-video", "film"),
+            Category::General => ("cat-documents", "page_white"),
+            Category::Torrents => ("cat-torrents", "folder_link"),
+            Category::Custom(_) => ("cat-folder", "folder"),
+        };
+        crate::chrome::IconKey::Themed(need, silk)
+    }
+
     /// Every category: General first.
     pub fn all() -> Vec<Category> {
         std::iter::once(Category::General)
@@ -415,6 +432,23 @@ pub fn browser_guess(url: &url::Url, context: &mdm_ipc::Command) -> String {
     )
 }
 
+/// The category whose folder a new download of `cat` takes (#1973): `cat`, or General when
+/// every download goes to one folder (Options → Save to), whatever its category; the download
+/// keeps `cat` for sorting the list.
+pub fn folder_category(cat: Category, one_folder: bool) -> Category {
+    if one_folder { Category::General } else { cat }
+}
+
+/// The folder a new download of `cat` goes to: [`category_folder`] of [`folder_category`].
+pub fn save_folder(
+    cat: Category,
+    one_folder: bool,
+    downloads: &Path,
+    dirs: &[(String, String)],
+) -> PathBuf {
+    category_folder(folder_category(cat, one_folder), downloads, dirs)
+}
+
 /// The category's folder: the one chosen in Options → Save to (or remembered from Download
 /// File Info), else the default under [`default_downloads`] (#556).
 pub fn category_folder(cat: Category, downloads: &Path, dirs: &[(String, String)]) -> PathBuf {
@@ -439,6 +473,34 @@ pub enum Status {
     Stopped,
     Complete,
     Error,
+}
+
+/// A download's own request settings (#1778), set in its Properties while it isn't running:
+/// each one empty is the site rules' (Options → Connection → Site rules), else Options'. A
+/// resume with them still checks it is the same file before going on (the engine's validators,
+/// sizes and overlap): changed settings never join two files.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OwnRequest {
+    /// The User-Agent sent instead of the site rule's, the browser's or Options'.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    /// Headers added to its requests (name, value), above the site rules' of the same name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
+    /// Its proxy: "" none (direct), else an address (`http://host:port`, `socks5://…`). None:
+    /// Options → Proxy / Socks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// Its number of connections instead of the site's exception or Options' default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connections: Option<u32>,
+}
+
+impl OwnRequest {
+    pub fn is_empty(&self) -> bool {
+        *self == OwnRequest::default()
+    }
 }
 
 /// One row of the download list. The persisted part is everything but `live`.
@@ -565,6 +627,10 @@ pub struct Item {
     /// overnight is renewed the next day); cleared as it starts again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waits_for_address: bool,
+    /// Its last try failed because the site's bot check refused it (`Error::BotCheck`): the
+    /// whole site is given a rest (`crate::sitewait`), not only this file. Not kept with the list.
+    #[serde(skip)]
+    pub refused_by_site: bool,
     /// It was made from a private (incognito) window's download. Saved (with Options → General →
     /// "Keep private-window downloads in the list"), unlike `context.private`, which is memory
     /// only: read back, the row stays apart from normal windows' downloads (it neither takes
@@ -576,6 +642,11 @@ pub struct Item {
     /// its last run as yt-dlp gave it to MDM's engine (#795). The windows' "Address".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_url: Option<Url>,
+    /// Its own request settings, from its Properties → Connection... while it was stopped
+    /// (#1778), above the site rules' and Options': [`OwnRequest`]. Saved with the list, so a
+    /// resume after a restart asks the same way.
+    #[serde(default, skip_serializing_if = "OwnRequest::is_empty")]
+    pub own: OwnRequest,
     #[serde(skip)]
     pub live: Option<Live>,
     /// The session's temporary view while a torrent is being checked; never saved.
@@ -910,19 +981,24 @@ impl Job {
     }
 
     /// Stop and save: a live stream yt-dlp records is stopped and what it recorded kept
-    /// as a video, the download then done; an endless stream (an internet radio, a camera feed:
-    /// no length, no resume, #1780) is stopped and kept, what arrived its finished file
-    /// (`Download::keep`); anything else is cancelled as [`Job::cancel`] does. Whether an endless
-    /// stream was kept.
-    pub fn save(&self) -> bool {
+    /// as a video, the download then done; anything else is cancelled as [`Job::cancel`] does
+    /// (an endless stream too: only [`Job::keep`] keeps one).
+    pub fn save(&self) {
         match self {
-            Job::Video { job, .. } => {
-                job.save();
-                false
-            }
+            Job::Video { job, .. } => job.save(),
+            _ => self.cancel(),
+        }
+    }
+
+    /// Stop and keep (#1780), the progress window's button only: an endless stream (an internet
+    /// radio, a camera feed: no length, no resume) is stopped and what arrived kept as its
+    /// finished file (`Download::keep`); anything else is stopped as [`Job::save`] stops it.
+    /// Whether an endless stream was kept.
+    pub fn keep(&self) -> bool {
+        match self {
             Job::File(d) => d.keep(),
             _ => {
-                self.cancel();
+                self.save();
                 false
             }
         }
@@ -1398,8 +1474,10 @@ impl Item {
             referer: None,
             page: None,
             waits_for_address: false,
+            refused_by_site: false,
             private_window: false,
             file_url: None,
+            own: OwnRequest::default(),
             live: None,
             torrent_check: None,
             snap: None,
@@ -1624,6 +1702,8 @@ impl Item {
                 {
                     self.waits_for_address = true;
                 }
+                self.refused_by_site =
+                    failed_now && matches!(s.failure, Some(mdm_engine::Error::BotCheck));
                 // In the interface language; the engine's English when it gave no failure.
                 self.error = s.failure.as_ref().map(crate::errors::describe).or(s.error);
                 if self.video.is_some()
@@ -1820,8 +1900,9 @@ impl Item {
     }
 
     /// Running, an answer with no length that can't be resumed (an internet radio, a camera
-    /// feed, #1780): the user's stop keeps what arrived as its finished file (`Job::save`), and
-    /// its Pause button says so ("Stop and keep"). As its last snapshot says.
+    /// feed, #1780): its progress window's Pause button reads "Stop and keep" and keeps what
+    /// arrived as its finished file (`Job::keep`); its other stops keep nothing. As its last
+    /// snapshot says.
     pub fn endless(&self) -> bool {
         matches!(
             self.live,
@@ -2038,6 +2119,37 @@ impl Item {
     /// Every byte is in (#736): no rate and no time left, as once it is complete.
     pub fn past_last_byte(&self) -> bool {
         self.torrent.is_none() && self.snap.as_ref().is_some_and(every_byte_in)
+    }
+
+    /// The icon before its status (#2008), for what [`Item::status_text`] says: being moved,
+    /// checked or joined is still under way; an archive found damaged is a failure; a finished
+    /// torrent connected to peers is seeding.
+    pub fn status_icon(&self) -> crate::icons::StatusIcon {
+        use crate::icons::StatusIcon as S;
+        if self.move_from.is_some()
+            || self.torrent_checking().is_some()
+            || self.finishing(true).is_some()
+        {
+            return S::Checking;
+        }
+        if self.damaged_text(true).is_some() {
+            return S::Error;
+        }
+        match self.status {
+            Status::Complete
+                if self
+                    .torrent
+                    .as_ref()
+                    .is_some_and(|t| t.peers > 0 || t.up_speed > 0.0) =>
+            {
+                S::Seeding
+            }
+            Status::Complete => S::Complete,
+            Status::Error => S::Error,
+            Status::Queued => S::Queued,
+            Status::Stopped => S::Paused,
+            Status::Downloading => S::Downloading,
+        }
     }
 
     pub fn status_text(&self) -> String {
@@ -2799,6 +2911,7 @@ mod tests {
         it.snap = Some(super::tool_snapshot(p.clone(), &url));
         // A short word and how far in the list; the progress window says it whole.
         assert_eq!(it.status_text(), "Merging 45%");
+        assert_eq!(it.status_icon(), crate::icons::StatusIcon::Checking);
         assert_eq!(it.finishing(false).as_deref(), Some("Merging... (45%)"));
         assert!(it.past_last_byte());
         p.merging = Some(None);
@@ -2810,6 +2923,7 @@ mod tests {
         s.finishing = Some(0.5);
         it.snap = Some(s);
         assert_eq!(it.status_text(), "Checking 50%");
+        assert_eq!(it.status_icon(), crate::icons::StatusIcon::Checking);
         assert_eq!(it.finishing(false).as_deref(), Some("Verifying... (50%)"));
         assert!(it.past_last_byte());
         // Still coming in (yt-dlp's own connection receiving): a rate and a time left as before.
@@ -2827,6 +2941,40 @@ mod tests {
         p.downloaded = 99 * m;
         it.snap = Some(super::tool_snapshot(p, &url));
         assert!(!it.past_last_byte());
+    }
+
+    /// #2008: each state its icon before the status: stopped part way is paused, a finished
+    /// torrent connected to peers is seeding, an archive found damaged a failure.
+    #[test]
+    fn each_state_has_its_status_icon() {
+        use crate::icons::StatusIcon as S;
+        let mut it = video_item(Some(100), 10, Status::Downloading);
+        it.video = None;
+        for (status, icon) in [
+            (Status::Downloading, S::Downloading),
+            (Status::Stopped, S::Paused),
+            (Status::Queued, S::Queued),
+            (Status::Error, S::Error),
+            (Status::Complete, S::Complete),
+        ] {
+            it.status = status;
+            assert_eq!(it.status_icon(), icon, "{status:?}");
+        }
+        it.damaged = true;
+        assert_eq!(it.status_text(), "Damaged");
+        assert_eq!(it.status_icon(), S::Error);
+        it.damaged = false;
+        it.move_from = Some(PathBuf::from("old"));
+        assert_eq!(it.status_icon(), S::Checking);
+        it.move_from = None;
+        let spec: crate::torrents::TorrentSpec = serde_json::from_str(
+            r#"{"hash":"0123456789abcdef0123456789abcdef01234567","folder":"t"}"#,
+        )
+        .unwrap();
+        it.torrent = Some(spec);
+        assert_eq!(it.status_icon(), S::Complete, "no peers: not seeding");
+        it.torrent.as_mut().unwrap().peers = 3;
+        assert_eq!(it.status_icon(), S::Seeding);
     }
 
     /// Without a size there's no share to show: no 0 % (from #384).
